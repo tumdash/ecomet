@@ -29,6 +29,9 @@
   parse/1,
   run_statements/1,
   get/3,get/4,
+  subscribe/4,subscribe/5,
+  unsubscribe/1,
+  on_commit/1,
   set/3,
   delete/2,delete/3,
   execute/2,execute/3,
@@ -171,6 +174,290 @@ system(DBs,Fields,Conditions)->
     reduce = Reduce
   },
   execute(Compiled,DBs,{'OR',ecomet_resultset:new()}).
+
+%%=====================================================================
+%%	SUBSCRIBE
+%%=====================================================================
+%
+% The subscription matching algorithm is based on query normalization (see normalized lower).
+% The query conditions are coerced to the list of conditions of the next format:
+% [
+%		{ AND, ANDNOT, DirectAND, DirectANDNOT },
+%		{ AND, ANDNOT, DirectAND, DirectANDNOT },
+%		...
+% ]
+% Each item of the list is a tuple of 4 elements (further - cortege).
+% Each element of the cortege is a list of conditions.
+% To satisfy a subscription an object MUST satisfy at least one cortege in the list.
+% To satisfy a cortege an object MUST satisfy ALL the 4 element in the cortege.
+% To satisfy:
+% * AND - list of 'TAG', an object MUST have all the tags in the list
+% * ANDNOT - list of 'TAG', an object MUST NOT have at least ONE
+% * DirectAND - list of direct constraints, an object MUST satisfy ALL
+% * DirectANDNOT - list of direct constraints, an object MUST NOT satisfy at least ONE
+%
+% The matching procedure consists of two phases:
+% 1. SEARCH potential subscriptions.
+% 2. FINAL MATCH an object to constraints of every subscription found at the step 1
+%
+% SEARCH. The goal is optimization. At this step we try to narrow the
+% scope as much as possible. The search is based on premise:
+% 1. An object MAY satisfy a subscription if it has at least 3 tags of the AND in ANY cortege.
+% 		if AND contains less than 3 tags, the tail is filled with 'none'
+% 2. The changed fields MUST include at least ONE field involved either in conditions or
+% 		in the requested fields
+% 3. An object MUST satisfy at least ONE tag among the rights.
+% 4. An object MUST belong to ONE of the requested databases
+%
+% To be able to efficiently perform the SEARCH we create an accordingly indexed object for
+% each subscription. Therefore we can use the standard query engine.
+% The SEARCH is performed by the process making a commit. If a subscription is among the results of SEARCH
+% then the commit log is passed to its handling process for FINAL MATCH
+%
+% FINAL MATCH is performed by the session process (see ecomet_session)
+%
+% Arguments are the same as for 'get' (see get). Not all parameters are supported for
+% subscriptions.
+% Grouping, Sorting, Pagination are not supported.
+% no_feedback, stateless are supported
+subscribe(ID,DBs,Fields,Conditions)->
+  subscribe(ID,DBs,Fields,Conditions,#{}).
+subscribe(ID,DBs,Fields,Conditions,InParams)->
+
+  #{
+    stateless := Stateless,     % No initial query, only updates
+    no_feedback := NoFeedback    % Do not send updates back to the author process
+  } = maps:merge(#{
+    stateless => false,
+    no_feedback => false
+  },InParams),
+
+  %----------Compile fields---------------------------
+  % Per object reading plan
+  ReadMap=read_map(Fields),
+
+  % Fields dependencies
+  FieldsDeps=ordsets:union([field_args(F)|| {_,F}<-maps:to_list(ReadMap) ]),
+
+  % Compile the subscription constraints
+  CompiledSubscription = ecomet_resultset:subscription_prepare(Conditions),
+
+  % Get involved fields
+  TagsDeps = ecomet_resultset:subscription_fields(CompiledSubscription),
+
+  % The total fields dependencies
+  Deps = ordsets:union([FieldsDeps,TagsDeps,[<<".readgroups">>]]),
+
+  % User rights
+  Rights=
+    case ecomet_user:is_admin() of
+      {ok,true}->[is_admin];
+      _->
+        {ok,UserGroups}=ecomet_user:get_usergroups(),
+        UserGroups
+    end,
+
+  % Subscription indexes (for the SEARCH phase)
+  Index = ecomet_resultset:subscription_indexes(CompiledSubscription),
+
+  % Register a subscription object for the SEARCH phase.
+  % The TS is a time point from which
+  ok = ecomet_session:register_subscription(#{
+    <<".name">>=>ID,
+    <<"rights">>=>Rights,
+    <<"databases">>=>DBs,
+    <<"index">>=>Index,
+    <<"dependencies">>=>Deps,
+    <<"no_feedback">>=>NoFeedback
+  }),
+
+  % Compile the function for building query fields
+  Read=
+    fun(Changed,Object)->
+      maps:fold(fun(_,#field{alias = Alias,value = #get{args = Args,value=Fun}},Acc)->
+        case ordsets:intersection(Changed,Args) of
+          []->
+            % If the changes are not among the function arguments list the the field is not affected
+            Acc;
+          _->
+            % The value has to be recalculated
+            Acc#{Alias=>Fun(Object)}
+        end
+      end,#{},ReadMap)
+    end,
+
+  % If the subscription is not stateless (default) then we need to
+  % perform a traditional search for what is already satisfies the conditions
+  StartTS=
+    if
+      not Stateless -> init_subscription_state(ID,DBs,Deps,Conditions,Read);
+      true -> -1
+    end,
+
+  % Conditions match function
+  TagsMatch= ecomet_resultset:subscription_match_function(CompiledSubscription),
+
+  % Rights match
+  RightsMatch=
+    if
+      Rights =:=[is_admin]-> fun(_)->true end;
+      true ->
+        fun(InRights)->
+          case ordsets:intersection(Rights,InRights) of
+            []->false;
+            _->true
+          end
+        end
+    end,
+
+  %--------------FINAL MATCH-----------------------------------------------
+  Self=self(),
+  Match=
+    fun
+      (#ecomet_log{ts=TS,handler = on_create}) when TS =< StartTS->
+        % If the object is created before the TS of the last object in the initial
+        % state result, the just ignore it because it is already sent
+        false;
+      (#ecomet_log{
+        object = #{<<".oid">>:=OID} = Object,
+        tags = { TNew, TOld, TDel },
+        rights = { RNew, ROld, RDel },
+        changes = Changes
+      })->
+        case match_log( TNew, TOld, TDel, fun(Tags)->TagsMatch(Tags,Object) end ) of
+          false->false;
+          TagsResult->
+            case match_log( RNew, ROld, RDel, RightsMatch ) of
+              false-> false;
+              RightsResult->
+                if
+                  TagsResult =:= add,RightsResult=:=del->false ;
+                  TagsResult =:= del,RightsResult=:=add->false ;
+                  TagsResult =:= add;RightsResult=:=add ->
+                    Self!?SUBSCRIPTION(ID,create,OID,Read(Deps,Object));
+                  TagsResult =:= del;RightsResult=:=del ->
+                    Self!?SUBSCRIPTION(ID,delete,OID);
+                  true ->
+                    Self!?SUBSCRIPTION(ID,update,OID,Read(Changes,Object))
+                end
+            end
+        end
+      end,
+
+  % Run the subscription
+  ok = ecomet_session:run_subscription(ID,Match).
+
+unsubscribe(ID)->
+  ok = ecomet_session:remove_subscription(ID).
+
+match_log( [], Tags, [], Match )->
+  case Match(Tags) of
+    false->false;
+    _->upd
+  end;
+match_log( New, Old, Del, Match )->
+  Now = Match(ordsets:union(New,Old)),
+  Was = Match(ordsets:union(Old,Del)),
+  if
+    Now,Was -> upd ;
+    Now, not Was-> add;
+    not Now, Was-> del;
+    true -> false
+  end.
+
+init_subscription_state(ID,DBs,Deps,Conditions,Read)->
+  F=
+    fun([OID|Values])->
+      Object = maps:from_list(lists:zip(Deps,Values)),
+      ?SUBSCRIPTION(ID,create,OID,Read(Deps,Object))
+    end,
+  Fields = [<<".ts">>,{F, [<<".oid">>|Deps]}],
+  {_Header, Objects}=ecomet_query:get(DBs,Fields,Conditions,[{order,[{<<".ts">>,'ASC'}]}]),
+
+  % Send the results
+  Self=self(),
+  lists:foldl(fun([TS,Msg],_)->
+    Self!Msg,
+    TS
+  end,-1,Objects).
+
+on_commit(#ecomet_log{ changes = [] })->
+  % No changes
+  ok;
+on_commit(#ecomet_log{
+  db = DB,
+  tags = {TAdd, TOld, TDel},
+  rights = { RAdd, ROld, RDel },
+  changes = ChangedFields
+} = Log)->
+
+  %-----------------------Sorting----------------------------------------------
+  [ TAdd1, TOld1, TDel1, RAdd1, ROld1, RDel1, ChangedFields1]=
+    [ordsets:from_list(I)||I<-[ TAdd, TOld, TDel, RAdd, ROld, RDel, ChangedFields] ],
+
+  %-----------------------The SEARCH phase-------------------------------------
+  Tags = TAdd1 ++ TOld1 ++ TDel1,
+  Index = {'AND',[
+    {'OR',[ {<<"index">>,'=',{T,1}}  || T<-Tags ]},
+    {'OR',[ {<<"index">>,'=',{T,2}} || T<-[none|Tags] ]},
+    {'OR',[ {<<"index">>,'=',{T,3}} || T<-[none|Tags] ]}
+  ]},
+
+  Rights =
+    {'OR',[{<<"rights">>,'=',T} || T <- [is_admin|RAdd1 ++ ROld1 ++ RDel1] ]},
+
+  Changes =
+    {'OR',[{<<"dependencies">>,'=',F} || F <- ChangedFields1]},
+
+  Query = ecomet_resultset:subscription_compile({'AND',[
+    Index,
+    Rights,
+    Changes,
+    {<<"databases">>,'=',DB}
+  ]}),
+
+  % Log with sorted items
+  Log1=Log#ecomet_log{
+    tags = {TAdd1, TOld1, TDel1},
+    rights = { RAdd1, ROld1, RDel1 },
+    changes = ChangedFields1
+  },
+
+  % Run the search on the other nodes
+  [ rpc:cast( N,?MODULE,notify,[ Query, Log1 ]) || N <-ecomet_node:get_ready_nodes() -- [node()] ],
+
+  % Local search
+  notify( Query, Log1 ),
+
+  ok.
+
+notify( Query, Log )->
+  Session =
+    case ecomet_user:get_session() of
+      {ok,S}->S;
+      _->none
+    end,
+
+  ecomet_resultset:execute_local(?ROOT,Query, fun(RS)->
+    ecomet_resultset:foldl(fun(OID,Acc)->
+      Object = ecomet_object:construct(OID),
+      #{
+        <<".name">>:=ID,
+        <<"PID">>:=PID,
+        <<"no_feedback">>:=NoFeedback
+      } = ecomet:read_fields(Object,[<<".name">>,<<"PID">>,<<"no_feedback">>]),
+
+      % TODO. More selective sort out the author of the changes
+      if
+        NoFeedback, PID=:=Session-> ok;
+        true ->
+          % Run the second (FINAL MATCH) phase
+          ecomet_session:on_subscription( PID, ID, Log )
+      end,
+      Acc
+    end,none,RS)
+  end, {'OR',ecomet_resultset:new()}).
+
 
 %%=====================================================================
 %%	SET
@@ -741,23 +1028,19 @@ is_aggregate([],Result)->Result.
 read_up(dirty)->
   fun(OID,Fields)->
     Object=ecomet_object:construct(OID),
-    read_up(Fields,Object,#{<<".oid">>=>OID,object=>Object})
+    maps:merge(ecomet_object:read_fields(Object,Fields),#{
+      <<".oid">>=>OID,
+      object=>Object
+    })
   end;
 read_up(Lock)->
   fun(OID,Fields)->
     Object=ecomet_object:open(OID,Lock),
-    read_up(Fields,Object,#{<<".oid">>=>OID,object=>Object})
+    maps:merge(ecomet_object:read_fields(Object,Fields),#{
+      <<".oid">>=>OID,
+      object=>Object
+    })
   end.
-read_up([<<".oid">>|Rest],Object,Acc)->
-  read_up(Rest,Object,Acc);
-read_up([Field|Rest],Object,Acc)->
-  {ok,Value}=ecomet:read_field(Object,Field),
-  read_up(Rest,Object,Acc#{Field=>Value});
-read_up([],Object,Acc)->
-  Acc#{
-    object=>Object,
-    <<".oid">>=>ecomet_object:get_oid(Object)
-  }.
 %%--------Local presorting----------------------------------
 % Tree level is sorted list of tuples - { Key, ItemList }.
 % ItemList can be subtree.
@@ -927,7 +1210,6 @@ set_rights(Type,Conditions)->
     {ok,true}->Conditions;
     {error,Error}->?ERROR(Error);
     _->
-      {ok,UserID}=ecomet_user:get_user(),
       {ok,UserGroups}=ecomet_user:get_usergroups(),
       Level=
         if
@@ -936,8 +1218,6 @@ set_rights(Type,Conditions)->
         end,
       {'AND',[
         Conditions,
-        {'OR',[
-          {Level,'=',GID}|| GID<-[UserID|UserGroups]
-        ]}
+        {'OR',[{Level,'=',GID}||GID<-UserGroups]}
       ]}
   end.

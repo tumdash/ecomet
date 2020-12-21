@@ -166,13 +166,11 @@ field_description(Type, Subtype, Index, Required, Storage, Default, Inc) ->
 }).
 -define(SUBSCRIPTION_SCHEMA,#{
   <<"PID">>=>#{ type => term, required => true, index=> [simple], storage => ?RAMLOCAL },
-  <<"session_PID">>=>#{ type => term, required => true, storage => ?RAMLOCAL },
-  <<"rights">>=>#{ type => list, subtype => link, required => true,index=> [simple], storage => ?RAMLOCAL },
-  <<"is_admin">>=>#{ type => bool, subtype => none, index=> [simple], storage => ?RAMLOCAL },
-  <<"reper_tags">>=>#{ type => list, subtype => term, required => true, index=> [simple], storage => ?RAMLOCAL },
-  <<"query_tags">>=>#{ type => list, subtype => term, required => true, index=> [simple], storage => ?RAMLOCAL },
-  <<"fields">>=>#{ type => list, subtype => term, required => true, index=> [simple], storage => ?RAMLOCAL },
-  <<"feedback">>=>#{ type => bool, subtype => none, index=> [simple], storage => ?RAMLOCAL }
+  <<"rights">>=>#{ type => list, subtype => term, required => true,index=> [simple], storage => ?RAMLOCAL },
+  <<"databases">>=>#{ type => list, subtype => atom, required => true,index=> [simple], storage => ?RAMLOCAL },
+  <<"index">>=>#{ type => list, subtype => term, required => true, index=> [simple], storage => ?RAMLOCAL },
+  <<"dependencies">>=>#{ type => list, subtype => string, required => true, index=> [simple], storage => ?RAMLOCAL },
+  <<"no_feedback">>=>#{ type => bool, subtype => none, storage => ?RAMLOCAL }
 }).
 
 % Database indexing
@@ -392,6 +390,9 @@ init([])->
   ok = init_default_users(),
 
   ok = ecomet_session:on_start_node(node()),
+
+  % Initialize subscriptions optimization
+  ok = ecomet_resultset:on_init(),
 
   Cycle=?ENV(schema_server_cycle,?DEFAULT_SCHEMA_CYCLE),
 

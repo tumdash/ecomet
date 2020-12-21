@@ -29,6 +29,7 @@
   logout/0,
   get_user/0,
   get_usergroups/0,
+  get_session/0,
   on_init_state/0,
   is_admin/0,
   get_salt/0
@@ -88,7 +89,7 @@ login(Login,Pass,Info)->
 logout()->
   case erase(?CONTEXT) of
     #state{session = PID} when is_pid(PID)->
-      ecomet_session:stop(PID,logout);
+      ecomet_session:stop(PID,{shutdown,logout});
     _->ok
   end.
 
@@ -102,11 +103,21 @@ get_user()->
 get_usergroups()->
   case get(?CONTEXT) of
     undefined->{error,user_undefined};
-    #state{groups=Groups}->
-      case Groups of
-        none->{ok,[]};
-        _->{ok,Groups}
+    #state{uid=UID,groups=Groups}->
+      if
+        is_list(Groups) ->
+          {ok, ordsets:from_list([UID|Groups])};
+        true -> {ok,[UID]}
       end
+  end.
+
+get_session()->
+  case get(?CONTEXT) of
+    undefined->{error,user_undefined};
+    #state{session = PID} when is_pid(PID)->
+      {ok,PID};
+    _->
+      {error,invalid_session}
   end.
 
 % Set user context for master init procedure
@@ -188,6 +199,11 @@ create_session(Info)->
   ok.
 
 set_context(User)->
+
+  % Close the session
+  logout(),
+
+  % save the context
   {ok,UserGroups} = ecomet:read_field(User,<<"usergroups">>),
   IsAdmin=is_admin(UserGroups),
   put(?CONTEXT,#state{
@@ -196,10 +212,11 @@ set_context(User)->
     is_admin=IsAdmin,
     groups=UserGroups
   }),
+
   ok.
 
 is_admin([GID|Rest])->
-  case ecomet_field:lookup_storage(ramdisc,GID,<<".name">>)  of
+  case ecomet_field:lookup_storage(disc,GID,<<".name">>)  of
     <<".administrators">>->true;
     _->is_admin(Rest)
   end;

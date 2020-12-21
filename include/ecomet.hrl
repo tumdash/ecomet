@@ -36,7 +36,15 @@
 -define(MAX_NODES,65535).
 
 -record(kv,{key,value}).
--record(ecomet_log,{oid,ts,handler,addtags,deltags,tags,fields}).
+-record(ecomet_log,{
+  object,
+  db,
+  ts,
+  handler,
+  tags,
+  rights,
+  changes
+}).
 
 -define(ERROR(Error),erlang:error(Error)).
 
@@ -54,6 +62,9 @@
     end
   end)()
 ).
+
+-define(SUBSCRIPTION(ID,Action,OID,Fields),{ecomet, ID, Action, OID, Fields }).
+-define(SUBSCRIPTION(ID,Action,OID),{ecomet, ID, Action, OID }).
 
 -define(A2B(Atom),unicode:characters_to_binary(atom_to_list(Atom))).
 

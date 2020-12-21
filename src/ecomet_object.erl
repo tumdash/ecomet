@@ -247,7 +247,7 @@ is_object(#object{})->
 is_object(_Other)->
   false.
 
-is_oid(?ObjectID(_,_))->
+is_oid(?ObjectID(P,I)) when is_integer(P),is_integer(I)->
   true;
 is_oid(_Invalid)->
   false.
@@ -279,10 +279,7 @@ check_rights(Read,Write)->
     {error,Error}->?ERROR(Error);
     {ok,true}->write;
     {ok,false}->
-      {ok,UID}=ecomet_user:get_user(),
-      {ok,UGroups}=ecomet_user:get_usergroups(),
-      UserGroups=ordsets:from_list([UID|UGroups]),
-
+      {ok,UserGroups}=ecomet_user:get_usergroups(),
       WriteGroups=if is_list(Write)->Write; true->[] end,
       case ordsets:intersection(UserGroups,WriteGroups) of
         []->
@@ -360,12 +357,12 @@ commit(OID,Dict)->
       [ ok = ecomet_backend:delete(DB,?DATA,Type,OID) || Type <- maps:keys(Storages) ],
       % The log record
       #ecomet_log{
-        oid=OID,
+        object = #{ <<".oid">> => OID },
+        db = DB,
         ts=ecomet_lib:log_ts(),
-        addtags=[],
-        deltags=Tags,
-        tags=[],
-        fields=[]
+        tags={[],[],Tags},
+        rights = {[],[],[ V || {<<".readgroups">>,V,_} <-Tags]},
+        changes = maps:keys(ecomet_pattern:get_fields(Map))
       };
     true->
       %----------Create/Edit procedure-----------------------
@@ -375,39 +372,54 @@ commit(OID,Dict)->
       LoadedFields=get_fields(Storages),
       % Get fields changes
       {UpdatedFields,ChangedFields}=ecomet_field:save_changes(Map,Fields,LoadedFields,OID),
+      if
+        length(ChangedFields)=:=0 ->
+          % No changes. Optimization
+          #ecomet_log{ changes = [] };
+        true ->
+          % Step 2. Indexes
+          % Update the object indexes and get changes
+          {Add,Unchanged,Del,UpdatedBackTags}= ecomet_index:build_index(OID,Map,ChangedFields,BackTags),
 
-      % Step 2. Indexes
-      % Update the object indexes and get changes
-      {Add,Unchanged,Del,UpdatedBackTags}= ecomet_index:build_index(OID,Map,ChangedFields,BackTags),
+          % Step 3. Merge storage changes
+          NewStorages=
+            maps:fold(fun(T,StorageFields,Acc)->
+              case maps:size(StorageFields) of
+                0->
+                  maps:remove(T,Acc);
+                _->
+                  Acc#{T=> #{ fields=>StorageFields, tags=>maps:get(T,UpdatedBackTags,#{})} }
+              end
+                      end,Storages,UpdatedFields),
 
-      % Step 3. Merge storage changes
-      FieldsStorage = [ { Type, #{ fields=>S } } ||
-        { Type, S } <-maps:to_list(UpdatedFields) , is_map(S) andalso maps:size(S)>0 ],
-      TagStorage = [ { Type, #{ tags=>S } }
-        || { Type, S } <-maps:to_list(UpdatedBackTags) , is_map(S) andalso maps:size(S)>0 ],
-      NewStorages =
-        lists:foldl(fun({T,S},Acc)->
-          case Acc of
-            #{T := SAcc }->Acc#{ T => maps:merge(SAcc,S) };
-            _->Acc#{T=>S}
-          end
-        end,#{},FieldsStorage ++ TagStorage),
+          % Step 4.
+          % Remove empty storages
+          [ ok = ecomet_backend:delete(DB,?DATA,Type,OID) || Type <- maps:keys(Storages) -- maps:keys(NewStorages) ],
+          % Dump new/updated storages
+          [ ok = ecomet_backend:write(DB,?DATA,Type,OID,Storage) || {Type,Storage} <- maps:to_list(NewStorages) ],
 
-      % Step 4.
-      % Remove empty storages
-      [ ok = ecomet_backend:delete(DB,?DATA,Type,OID) || Type <- maps:keys(Storages) -- maps:keys(NewStorages) ],
-      % Dump new/updated storages
-      [ ok = ecomet_backend:write(DB,?DATA,Type,OID,Storage) || {Type,Storage} <- maps:to_list(NewStorages) ],
+          % Build the version of the object
+          LogObject = maps:fold(fun
+                                  ( _Type ,#{ fields := F}, Acc)->
+                                    maps:merge(Acc,F);
+                                  (_Type,_Empty,Acc)->
+                                    Acc
+                                end,#{},NewStorages),
 
-      % The log record
-      #ecomet_log{
-        oid=OID,
-        ts=ecomet_lib:log_ts(),
-        addtags=Add,
-        deltags=Del,
-        tags=Unchanged,
-        fields=ChangedFields
-      }
+          % The log record
+          #ecomet_log{
+            object = LogObject#{ <<".oid">> => OID },
+            db = DB,
+            ts=ecomet_lib:log_ts(),
+            tags={ Add, Unchanged, Del},
+            rights={
+              [ V || {<<".readgroups">>,V,_} <-Add],
+              [ V || {<<".readgroups">>,V,_} <-Unchanged],
+              [ V || {<<".readgroups">>,V,_} <-Del]
+            },
+            changes = [Name||{Name,_}<-ChangedFields]
+          }
+      end
   end.
 
 get_backtags(Storage)->
@@ -494,7 +506,7 @@ check_path(Object)->
           case ecomet_folder:find_object_system(FolderID,Name) of
             {error,not_found}->ok;
             {ok,OID}->ok;
-            _->{error,{not_unique,Name}}
+            _->?ERROR({not_unique,Name})
           end;
         _->?ERROR("the '/' symbol is not allowed in names")
       end;

@@ -21,14 +21,14 @@
 -include("ecomet.hrl").
 -include("ecomet_schema.hrl").
 
-%% ====================================================================
+%%====================================================================
 %% API functions
-%% ====================================================================
+%%====================================================================
 -export([
 	prepare/1,
 	normalize/1,
 	new/0,
-  new_branch/0,
+	new_branch/0,
 	execute/5,
 	execute_local/4,
 	remote_call/6,
@@ -38,7 +38,20 @@
 	foldl/3,
 	foldl/4,
 	fold/5
-	]).
+]).
+
+%%====================================================================
+%% Subscriptions API
+%%====================================================================
+-export([
+	on_init/0,
+	subscription_prepare/1,
+	subscription_fields/1,
+	subscription_indexes/1,
+	subscription_tags/1,
+	subscription_match_function/1,
+	subscription_compile/1
+]).
 
 %%====================================================================
 %%		Test API
@@ -58,8 +71,9 @@
 -endif.
 
 -define(TIMEOUT,30000).
+
 %%=====================================================================
-%%	Preparing query
+%%	query compilation
 %%=====================================================================
 %% For search process we need info about storages for indexes. It's contained in patterns. Next variants are possible:
 %% 1. Patterns are defined by query conditions. Example:
@@ -82,6 +96,145 @@ prepare(Conditions)->
 			optimize(Normal);
 		true->Built
 	end.
+
+%%=====================================================================
+%%	Subscriptions API
+%%=====================================================================
+on_init()->
+	% Store the subscription pattern as a persistent term for optimized access
+	PatternID = ?OID(<<"/root/.patterns/.subscription">>),
+	ID=ecomet_object:get_id(PatternID),
+	Bit=ecomet_bits:set_bit(ID,none),
+	persistent_term:put({?MODULE,subscription_pattern},Bit),
+	ok.
+
+subscription_prepare(Conditions)->
+
+	% Standard preparation procedure
+	Patterned=define_patterns(Conditions),
+	{Built,_Direct}=build_conditions(Patterned,element(3,Patterned)),
+
+	% Normalization
+	{'OR',Normal,_}=normalize(Built),
+
+	% Extract tags
+	[{
+			[ Tag || {'TAG',Tag,_} <- AND ], 				% 1. And tags
+			[ Tag || {'TAG',Tag,_} <- ANDNOT ],			% 2. Andnot tags
+			[ Tag || {'DIRECT',Tag,_} <- DAND] ,		% 3. And direct conditions
+			[ Tag || {'DIRECT',Tag,_} <- DANDNOT]		% 4. Andnot direct conditions
+		}
+	|| {'NORM',{ {{'AND',AND,_},{'OR',ANDNOT,_}}, {DAND, DANDNOT} }, _} <- Normal ].
+
+subscription_fields(Subscription)->
+	Fields=
+		[
+			[ F || {F, _, _ } <- AND ] ++
+			[ F || {F, _, _ } <- ANDNOT ] ++
+			[ F || {_, F, _ } <- DAND ] ++
+			[ F || {_, F, _ } <- DANDNOT ]
+		||{ AND, ANDNOT, DAND, DANDNOT} <- Subscription ],
+	ordsets:from_list(lists:append(Fields)).
+
+subscription_indexes(Subscription)->
+	Index=
+		[case AND of
+			 [T1,T2,T3|_] ->[{T1,1},{T2,2},{T3,3}];
+			 [T1,T2]			->[{T1,1},{T2,2},{none,3}];
+			 [T1]					->[{T1,1},{none,2},{none,3}]
+		end ||{ AND, _ANDNOT, _DAND, _DANDNOT} <- Subscription ],
+	ordsets:from_list(lists:append(Index)).
+
+subscription_tags(Tags)->
+	Tags1=
+		[[{T,1},{T,2},{T,3}]|| T <- Tags],
+	[{none,2},{none,3}|lists:append(Tags1)].
+
+subscription_match_function(Subscription)->
+	Ordered=
+		[{
+			ordsets:from_list(AND),
+			ordsets:from_list(ANDNOT),
+			ordsets:from_list(DAND),
+			ordsets:from_list(DANDNOT)
+		} || { AND, ANDNOT, DAND, DANDNOT} <- Subscription ],
+
+	fun(Tags,Fields)->
+		reverse_check(Ordered,Tags,Fields)
+	end.
+
+subscription_compile(Query)->
+	case persistent_term:get({?MODULE,subscription_pattern},none) of
+		none->
+			% The schema is not initialized yet
+			prepare({<<"none">>,'=',none});
+		Pattern->
+			subscription_compile(Query,Pattern)
+	end.
+subscription_compile({'AND',List},Pattern)->
+	{'AND',[subscription_compile(I,Pattern)||I<-List],{Pattern,[]}};
+subscription_compile({'OR',List},Pattern)->
+	{'OR',[subscription_compile(I,Pattern)||I<-List],{Pattern,[]}};
+subscription_compile({Field,'=',Value},Pattern)->
+	{'TAG', {Field,Value,simple}, {Pattern,[{ramlocal,Pattern,[]}]}}.
+
+
+reverse_check([{And,AndNot,DAnd,DAndNot}|Rest],Tags,Fields)->
+	Result=
+		case ordsets:subtract(And,Tags) of
+			[]->
+				% The object satisfies all the ANDs
+				case ordsets:intersection(AndNot,Tags) of
+					[]->
+						% The object does not have any ANDNOTs
+						case direct_and(DAnd,Fields) of
+							true->
+								% The object satisfies all the Direct ANDs
+								case direct_or(DAndNot,Fields) of
+									false->
+										% The object does not have any Direct ANDNOTs
+										true;
+									_->
+										false
+								end;
+							_->
+								false
+						end;
+					_->
+						false
+				end;
+			_->
+				false
+		end,
+	if
+		Result -> Result;
+		true ->
+			reverse_check(Rest,Tags,Fields)
+	end;
+reverse_check([],_Tags,_Fields)->
+	false.
+
+direct_and([{Oper,Field,Value}|Rest],Fields)->
+	FieldValue = maps:get(Field,Fields,none),
+	case direct_compare(Oper,Value,FieldValue) of
+		false->false;
+		_->direct_and(Rest,Fields)
+	end;
+direct_and([],_Fields)->
+	true.
+
+direct_or([{Oper,Field,Value}|Rest],Fields)->
+	FieldValue = maps:get(Field,Fields,none),
+	case direct_compare(Oper,Value,FieldValue) of
+		true->true;
+		_->direct_or(Rest,Fields)
+	end;
+direct_or([],_Fields)->
+	false.
+
+%%=====================================================================
+%%	Compilation utilities
+%%=====================================================================
 %%
 %% Define conditions on patterns
 %%
@@ -721,16 +874,19 @@ check_direct([],_Oper,_Object,Result)->Result.
 check_condition({'DIRECT',{Oper,Field,Value},_},Object)->
 	case ecomet_object:read_field(Object,Field) of
 		{ok,FieldValue}->
-			case Oper of
-				':='->FieldValue==Value;
-				':>'->FieldValue>Value;
-				':>='->FieldValue>=Value;
-				':<'->FieldValue<Value;
-				':=<'->FieldValue=<Value;
-				':LIKE'->direct_like(FieldValue,Value);
-				':<>'->FieldValue/=Value
-			end;
+			direct_compare(Oper,Value,FieldValue);
 		{error,_}->false
+	end.
+
+direct_compare(Oper,Value,FieldValue)->
+	case Oper of
+		':='->FieldValue==Value;
+		':>'->FieldValue>Value;
+		':>='->FieldValue>=Value;
+		':<'->FieldValue<Value;
+		':=<'->FieldValue=<Value;
+		':LIKE'->direct_like(FieldValue,Value);
+		':<>'->FieldValue/=Value
 	end.
 
 direct_like(String,Pattern) when (is_binary(Pattern) and is_binary(String))->
