@@ -80,15 +80,7 @@
 
 
 -define(ObjectID(PatternID,ObjectID),{PatternID,ObjectID}).
--define(TRANSACTION(Fun),
-  case ecomet_transaction:get_type() of
-    none->
-      case ecomet_transaction:internal(Fun) of
-        {ok,_TResult}->_TResult;
-        {error,_TError}->?ERROR(_TError)
-      end;
-    _->Fun()
-  end).
+
 -define(SERVICE_FIELDS,#{
   <<".oid">>=>fun ecomet_lib:to_oid/1,
   <<".path">>=>fun ecomet_lib:to_path/1
@@ -126,7 +118,7 @@ create(#{ <<".pattern">>:=PatternID, <<".folder">>:=FolderID } = Fields)->
       OID=new_id(FolderID,PatternID),
       Object=#object{ oid=OID, edit=true, map=Map, db=get_db_name(OID) },
       % Wrap the operation into a transaction
-      ?TRANSACTION(fun()->
+      transaction(fun()->
         % Put empty storages to dict. Trick for no real lookups
         put_empty_storages(OID,Map),
         save(Object,Fields2,on_create)
@@ -712,7 +704,7 @@ load_storage_types(#object{oid=OID,map=Map,db=DB},Dict)->
 % Save routine. This routine runs when we edit object, that is not under behaviour handlers yet
 save(#object{oid=OID,map=Map}=Object,Fields,Handler)->
   % All operations within transaction. No changes applied if something is wrong
-  ?TRANSACTION(fun()->
+  transaction(fun()->
     ecomet_transaction:dict_put([
       {{OID,object},Object},	% Object is opened (created)
       {{OID,fields},Fields},	% Project has next changes (may by empty)
@@ -731,3 +723,16 @@ save(#object{oid=OID,map=Map}=Object,Fields,Handler)->
     % The result
     ok
   end).
+
+transaction(Fun) ->
+  case ecomet_transaction:get_type() of
+    none->
+      case ecomet_transaction:internal(Fun) of
+        {ok, TResult} ->
+          TResult;
+        {error, TError} ->
+          ?ERROR(TError)
+      end;
+    _ ->
+      Fun()
+  end.
